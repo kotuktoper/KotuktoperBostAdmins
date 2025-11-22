@@ -30,7 +30,7 @@ bot = telebot.TeleBot(TOKEN)
 logger.info("🟢 ===== МЕГА-БОТ ULTIMATE PRO MAX EDITION ЗАПУСКАЕТСЯ =====")
 
 # Глобальные админы
-GLOBAL_ADMINS = [5627578930, 7981729476]
+GLOBAL_ADMINS = [5627578930, 7981729476,-1001716767636]
 
 # СИСТЕМА ЗАДЕРЖКИ
 class CooldownSystem:
