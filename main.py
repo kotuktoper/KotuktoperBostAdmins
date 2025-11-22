@@ -24,13 +24,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Токен бота
-TOKEN = "8489739703:AAHMt_uN9a0PdVabUKW2bRYsX9Xm8opBZk4"
+TOKEN = "8489739703:AAGMnY4bPaKbXfzEOUtF64dDrgmT963_NzU"
 bot = telebot.TeleBot(TOKEN)
 
 logger.info("🟢 ===== МЕГА-БОТ ULTIMATE PRO MAX EDITION ЗАПУСКАЕТСЯ =====")
 
 # Глобальные админы
-GLOBAL_ADMINS = [5627578930, 7981729476,-1001716767636]
+GLOBAL_ADMINS = [5627578930, 7981729476,-1001716767636,1001716767636]
 
 # СИСТЕМА ЗАДЕРЖКИ
 class CooldownSystem:
