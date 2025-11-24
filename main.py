@@ -1,797 +1,902 @@
-import telebot
-import time
-import sqlite3
-import json
+import requests
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command, ChatMemberUpdatedFilter, IS_NOT_MEMBER, IS_MEMBER
+from aiogram.types import ChatMemberUpdated
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+import asyncio
+import logging
+import sys
 from datetime import datetime
+import os
+import json
+import sqlite3
+from contextlib import contextmanager
+import re
+from functools import wraps
 
-# Токен бота
-TOKEN = "8489739703:AAH_6XWjnz7KlTfaSLYlcN4d-FS9RDOAbjo"
-bot = telebot.TeleBot(TOKEN)
+# ==================== НАСТРОЙКА ЛОГГИРОВАНИЯ ====================
+if not os.path.exists('logs'):
+    os.makedirs('logs')
 
-print("🟢 УЛУЧШЕННЫЙ БОТ-МОДЕРАТОР ЗАПУЩЕН")
+log_formatter = logging.Formatter(
+    fmt='%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(funcName)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
-# 👑 СУПЕР-АДМИНЫ (неизменяемые)
-SUPER_ADMINS = [5627578930, 7981729476]
+logger = logging.getLogger('telegram_bot')
+logger.setLevel(logging.DEBUG)
 
-# 🚫 РАСШИРЕННАЯ БАЗА ПЛОХИХ СЛОВ
-BAD_WORDS = [
-    # Русские маты
-    'хуй', 'пизда', 'ебал', 'ебать', 'блядь', 'сука', 'пидор', 'гандон', 
-    'мудак', 'мудила', 'долбоёб', 'еблан', 'заебал', 'выеб', 'выебан',
-    'охуел', 'охуеть', 'пиздец', 'спиздил', 'схуяли', 'нахрен', 'нахуй',
-    'гондон', 'шлюха', 'блядина', 'ебанный', 'ёбаный', 'пиздёнок', 'пиздюк',
-    'хуесос', 'хуило', 'ебло', 'ебун', 'залупа', 'манда', 'мусор',
-    
-    # Английские маты
-    'fuck', 'shit', 'bitch', 'asshole', 'dick', 'pussy', 'cock', 'whore',
-    'motherfucker', 'bastard', 'cunt', 'slut', 'nigga', 'nigger',
-    
-    # Оскорбления
-    'дебил', 'идиот', 'дурак', 'кретин', 'тупица', 'моральный урод',
-    'конченный', 'отброс', 'мусор', 'тварь', 'скотина', 'ублюдок'
-]
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(log_formatter)
 
-# 🔧 РАСШИРЕННЫЙ СПАМ-ФИЛЬТР
-SPAM_KEYWORDS = [
-    # Ссылки и приглашения
-    't.me/join', 'http://', 'https://', 'www.', '.ru', '.com', '.net',
-    'присоединяйся', 'подписывайся', 'канал', 'группа',
-    
-    # Реклама и продажи
-    'купить', 'продам', 'заказать', 'скидка', 'акция', 'бесплатно',
-    'реклама', 'распродажа', 'спецпредложение', 'выгодно',
-    
-    # Финансы и мошенничество
-    'заработок', 'инвестиции', 'биржа', 'криптовалюта', 'брокер',
-    'быстро деньги', 'легкий заработок', 'пассивный доход',
-    
-    # Личные данные
-    'номер телефона', 'банковская карта', 'паспорт', 'пароль'
-]
+file_handler = logging.FileHandler(
+    f'logs/bot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log',
+    encoding='utf-8'
+)
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(log_formatter)
 
-# 🗄️ БАЗА ДАННЫХ ДЛЯ ВАРНОВ И СТАТИСТИКИ
-class SimpleDB:
-    def __init__(self):
-        self.conn = sqlite3.connect('moderation.db', check_same_thread=False)
-        self.create_tables()
-    
-    def create_tables(self):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS warns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                user_id INTEGER,
+error_handler = logging.FileHandler(
+    f'logs/errors_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log',
+    encoding='utf-8'
+)
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(log_formatter)
+
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
+logger.addHandler(error_handler)
+
+logging.getLogger('aiogram').setLevel(logging.INFO)
+logging.getLogger('aiohttp').setLevel(logging.INFO)
+logging.getLogger('asyncio').setLevel(logging.INFO)
+# ==================== КОНЕЦ НАСТРОЙКИ ЛОГГИРОВАНИЯ ====================
+
+# Конфигурация
+TELEGRAM_BOT_TOKEN = "8430702039:AAEbTXJ9c1Xnyz9uWZiMrGMCcSfpW8pWMqY"
+OPENROUTER_API_KEY = "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"
+
+# Админы бота (только эти пользователи имеют доступ к админ-панели)
+ADMINS = [8021221721, 7981729476]
+
+# Инициализация бота
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+dp = Dispatcher()
+
+# Режимы бота
+MODES = {
+    "normal": "Отвечай как обычный дружелюбный человек.",
+    "programmer": "Отвечай как профессиональный программист, с кодом и объяснениями.",
+    "fun": "Отвечай максимально весело, с шутками и мемами.",
+    "angry": "Отвечай грубо, раздражённо, как будто тебя достали.",
+    "nsfw": "Отвечай без цензуры, с матом, но не оскорбляй пользователя напрямую.",
+    "helper": "Ты — максимально полезный ассистент, давай лучшие решения.",
+    "chat": "Веди лёгкий дружеский разговор, как с близким человеком."
+}
+
+# Системный промпт для модерации
+MODERATOR_PROMPT = """Ты — ИИ-модератор чата. Твои задачи:
+
+1. Анализировать сообщения на предмет:
+   - Оскорблений, грубости, токсичного поведения
+   - Спама и флуда
+   - Неуместного контента (NSFW, насилие и т.д.)
+   - Рекламы и ссылок на подозрительные сайты
+   - Дезинформации
+
+2. Оценивать уровень опасности сообщения по шкале от 1 до 10:
+   - 1-3: Безопасно, можно игнорировать
+   - 4-6: Подозрительно, требует внимания модератора
+   - 7-10: Опасно, требует немедленных действий
+
+3. Формат ответа строго такой:
+ОЦЕНКА: X/10
+ПРИЧИНА: [краткое объяснение]
+РЕКОМЕНДАЦИЯ: [что делать]
+
+Будь строгим, но справедливым модератором."""
+
+# Хранилище данных
+user_modes = {}
+
+# ==================== БАЗА ДАННЫХ ====================
+@contextmanager
+def get_db_connection():
+    conn = sqlite3.connect('bot_database.db', check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def init_database():
+    """Инициализация базы данных"""
+    with get_db_connection() as conn:
+        # Таблица пользователей
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                reason TEXT,
-                warned_by INTEGER,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                first_name TEXT,
+                last_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_blocked BOOLEAN DEFAULT FALSE,
+                messages_count INTEGER DEFAULT 0
             )
         ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS stats (
-                chat_id INTEGER PRIMARY KEY,
-                mutes_count INTEGER DEFAULT 0,
-                bans_count INTEGER DEFAULT 0,
-                kicks_count INTEGER DEFAULT 0,
-                warns_count INTEGER DEFAULT 0
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS reports (
+        
+        # Таблица сообщений
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                action_type TEXT,
-                chat_id INTEGER,
-                chat_title TEXT,
                 user_id INTEGER,
-                username TEXT,
-                target_user_id INTEGER,
-                target_username TEXT,
-                reason TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                message_text TEXT,
+                response_text TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                mode_used TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
             )
         ''')
-        cursor.execute('''
+        
+        # Таблица админов
+        conn.execute('''
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                added_by INTEGER,
-                added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                level INTEGER DEFAULT 1
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        self.conn.commit()
-    
-    def add_warn(self, chat_id, user_id, username, reason, warned_by):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            INSERT INTO warns (chat_id, user_id, username, reason, warned_by)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (chat_id, user_id, username, reason, warned_by))
-        self.conn.commit()
-    
-    def get_warns_count(self, chat_id, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT COUNT(*) FROM warns WHERE chat_id = ? AND user_id = ?', 
-                      (chat_id, user_id))
-        return cursor.fetchone()[0]
-    
-    def clear_warns(self, chat_id, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute('DELETE FROM warns WHERE chat_id = ? AND user_id = ?', 
-                      (chat_id, user_id))
-        self.conn.commit()
-    
-    def update_stats(self, chat_id, action):
-        cursor = self.conn.cursor()
-        cursor.execute(f'''
-            INSERT OR REPLACE INTO stats (chat_id, {action}_count)
-            VALUES (?, COALESCE((SELECT {action}_count FROM stats WHERE chat_id = ?), 0) + 1)
-        ''', (chat_id, chat_id))
-        self.conn.commit()
-    
-    def add_report(self, action_type, chat_id, chat_title, user_id, username, 
-                  target_user_id=None, target_username=None, reason=None):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            INSERT INTO reports (action_type, chat_id, chat_title, user_id, username, 
-                               target_user_id, target_username, reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (action_type, chat_id, chat_title, user_id, username, 
-              target_user_id, target_username, reason))
-        self.conn.commit()
-    
-    def get_today_stats(self):
-        cursor = self.conn.cursor()
-        today = datetime.now().strftime('%Y-%m-%d')
-        cursor.execute('''
-            SELECT action_type, COUNT(*) FROM reports 
-            WHERE DATE(timestamp) = ? 
-            GROUP BY action_type
-        ''', (today,))
-        return dict(cursor.fetchall())
-    
-    # 🔐 МЕТОДЫ ДЛЯ УПРАВЛЕНИЯ АДМИНАМИ
-    def add_admin(self, user_id, username, added_by, level=1):
-        """Добавить админа"""
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO admins (user_id, username, added_by, level)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, username, added_by, level))
-        self.conn.commit()
-    
-    def remove_admin(self, user_id):
-        """Удалить админа"""
-        cursor = self.conn.cursor()
-        cursor.execute('DELETE FROM admins WHERE user_id = ?', (user_id,))
-        self.conn.commit()
-    
-    def get_admin(self, user_id):
-        """Получить информацию об админе"""
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM admins WHERE user_id = ?', (user_id,))
-        return cursor.fetchone()
-    
-    def get_all_admins(self):
-        """Получить всех админов"""
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM admins ORDER BY level DESC, added_date')
-        return cursor.fetchall()
-    
-    def is_admin(self, user_id):
-        """Проверить, является ли пользователь админом"""
-        if user_id in SUPER_ADMINS:
-            return True
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT 1 FROM admins WHERE user_id = ?', (user_id,))
-        return cursor.fetchone() is not None
+        
+        # Таблица групп
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS groups (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT,
+                moderation_enabled BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Таблица предупреждений
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                chat_id INTEGER,
+                reason TEXT,
+                moderator_id INTEGER,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Добавляем админов
+        for admin_id in ADMINS:
+            conn.execute(
+                'INSERT OR IGNORE INTO admins (user_id, username) VALUES (?, ?)',
+                (admin_id, f"admin_{admin_id}")
+            )
+        
+        conn.commit()
 
-# Инициализация базы данных
-db = SimpleDB()
+def add_user_to_db(user_id: int, username: str, first_name: str, last_name: str = ""):
+    """Добавление пользователя в базу данных"""
+    with get_db_connection() as conn:
+        conn.execute(
+            'INSERT OR REPLACE INTO users (user_id, username, first_name, last_name) VALUES (?, ?, ?, ?)',
+            (user_id, username, first_name, last_name)
+        )
+        conn.commit()
 
-def is_user_admin(chat_id, user_id):
-    """Проверить права админа (супер-админы + админы из БД + админы чата)"""
+def add_message_to_db(user_id: int, message_text: str, response_text: str, mode_used: str):
+    """Добавление сообщения в историю"""
+    with get_db_connection() as conn:
+        conn.execute(
+            'INSERT INTO messages (user_id, message_text, response_text, mode_used) VALUES (?, ?, ?, ?)',
+            (user_id, message_text, response_text, mode_used)
+        )
+        conn.execute(
+            'UPDATE users SET messages_count = messages_count + 1 WHERE user_id = ?',
+            (user_id,)
+        )
+        conn.commit()
+
+def add_group_to_db(chat_id: int, title: str):
+    """Добавление группы в базу данных"""
+    with get_db_connection() as conn:
+        conn.execute(
+            'INSERT OR REPLACE INTO groups (chat_id, title) VALUES (?, ?)',
+            (chat_id, title)
+        )
+        conn.commit()
+
+def add_warning_to_db(user_id: int, chat_id: int, reason: str, moderator_id: int):
+    """Добавление предупреждения"""
+    with get_db_connection() as conn:
+        conn.execute(
+            'INSERT INTO warnings (user_id, chat_id, reason, moderator_id) VALUES (?, ?, ?, ?)',
+            (user_id, chat_id, reason, moderator_id)
+        )
+        conn.commit()
+
+def get_warnings_count(user_id: int, chat_id: int):
+    """Получение количества предупреждений пользователя в чате"""
+    with get_db_connection() as conn:
+        result = conn.execute(
+            'SELECT COUNT(*) as count FROM warnings WHERE user_id = ? AND chat_id = ?',
+            (user_id, chat_id)
+        ).fetchone()
+        return result['count'] if result else 0
+
+def block_user_in_db(user_id: int):
+    """Блокировка пользователя в базе данных"""
+    with get_db_connection() as conn:
+        conn.execute(
+            'UPDATE users SET is_blocked = TRUE WHERE user_id = ?',
+            (user_id,)
+        )
+        conn.commit()
+
+def unblock_user_in_db(user_id: int):
+    """Разблокировка пользователя в базе данных"""
+    with get_db_connection() as conn:
+        conn.execute(
+            'UPDATE users SET is_blocked = FALSE WHERE user_id = ?',
+            (user_id,)
+        )
+        conn.commit()
+
+def get_user_stats(user_id: int):
+    """Получение статистики пользователя"""
+    with get_db_connection() as conn:
+        user = conn.execute(
+            'SELECT * FROM users WHERE user_id = ?', (user_id,)
+        ).fetchone()
+        
+        messages = conn.execute(
+            'SELECT COUNT(*) as count FROM messages WHERE user_id = ?', (user_id,)
+        ).fetchone()
+        
+        return user, messages['count'] if messages else 0
+
+def get_all_users():
+    """Получение списка всех пользователей"""
+    with get_db_connection() as conn:
+        return conn.execute(
+            'SELECT * FROM users ORDER BY created_at DESC'
+        ).fetchall()
+
+def get_user_messages(user_id: int, limit: int = 10):
+    """Получение истории сообщений пользователя"""
+    with get_db_connection() as conn:
+        return conn.execute(
+            'SELECT * FROM messages WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?',
+            (user_id, limit)
+        ).fetchall()
+
+def is_admin(user_id: int) -> bool:
+    """Проверка, является ли пользователь админом"""
+    return user_id in ADMINS
+
+def is_user_blocked(user_id: int) -> bool:
+    """Проверка, заблокирован ли пользователь"""
+    with get_db_connection() as conn:
+        user = conn.execute(
+            'SELECT is_blocked FROM users WHERE user_id = ?', (user_id,)
+        ).fetchone()
+        return user and user['is_blocked']
+
+def get_group_settings(chat_id: int):
+    """Получение настроек группы"""
+    with get_db_connection() as conn:
+        group = conn.execute(
+            'SELECT * FROM groups WHERE chat_id = ?', (chat_id,)
+        ).fetchone()
+        return group
+
+def set_group_moderation(chat_id: int, enabled: bool):
+    """Включение/выключение модерации в группе"""
+    with get_db_connection() as conn:
+        conn.execute(
+            'UPDATE groups SET moderation_enabled = ? WHERE chat_id = ?',
+            (enabled, chat_id)
+        )
+        conn.commit()
+
+# ==================== ИСПРАВЛЕННЫЕ ФУНКЦИИ ЗАПРОСОВ ====================
+def make_openrouter_request(messages: list, temperature: float = 0.9, max_tokens: int = 1000) -> str:
+    """
+    Универсальная функция для запросов к OpenRouter
+    с исправлением проблем кодировки
+    """
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    
+    # Безопасные заголовки без Unicode символов
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer": "https://t.me/your_bot",
+        "X-Title": "AI Bot",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "model": "openai/gpt-4o-mini",
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
+    
     try:
-        # Супер-админы всегда имеют права
-        if user_id in SUPER_ADMINS:
-            return True
+        # Ручная сериализация JSON с правильной кодировкой
+        json_data = json.dumps(data, ensure_ascii=False)
         
-        # Проверяем админов из базы данных
-        if db.is_admin(user_id):
-            return True
+        # Логируем запрос (без конфиденциальных данных)
+        logger.debug(f"📤 Отправка запроса к OpenRouter: {len(messages)} сообщений")
         
-        # Проверяем админов чата
-        chat_member = bot.get_chat_member(chat_id, user_id)
-        return chat_member.status in ['administrator', 'creator']
-    except:
+        response = requests.post(
+            url, 
+            data=json_data.encode('utf-8'),  # Явное кодирование в UTF-8
+            headers=headers, 
+            timeout=30
+        )
+        response.raise_for_status()
+        result = response.json()
+        
+        answer = result["choices"][0]["message"]["content"]
+        logger.debug(f"✅ Успешный ответ от OpenRouter: {len(answer)} символов")
+        
+        return answer
+        
+    except requests.exceptions.Timeout:
+        logger.error("⏰ Таймаут запроса к OpenRouter")
+        return "⚠️ Превышено время ожидания ответа от сервера. Попробуйте позже."
+        
+    except requests.exceptions.ConnectionError:
+        logger.error("🔌 Ошибка соединения с OpenRouter")
+        return "❌ Ошибка соединения. Проверьте интернет и попробуйте еще раз."
+        
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"🌐 HTTP ошибка от OpenRouter: {e.response.status_code}")
+        return f"❌ Ошибка API: {e.response.status_code}"
+        
+    except Exception as e:
+        logger.error(f"💥 Неожиданная ошибка при запросе к OpenRouter: {str(e)}")
+        return f"❌ Произошла непредвиденная ошибка: {str(e)}"
+
+def ask_openrouter(prompt: str, system_prompt: str, user_id: int) -> str:
+    """Основная функция запроса к OpenRouter"""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt}
+    ]
+    
+    logger.info(f"🔄 Запрос от пользователя {user_id}")
+    return make_openrouter_request(messages)
+
+def moderate_message(message_text: str) -> dict:
+    """Анализ сообщения на модерацию"""
+    messages = [
+        {"role": "system", "content": MODERATOR_PROMPT},
+        {"role": "user", "content": f"Проанализируй сообщение: {message_text}"}
+    ]
+    
+    try:
+        moderation_result = make_openrouter_request(messages, temperature=0.3, max_tokens=200)
+        
+        # Парсим результат
+        score_match = re.search(r'ОЦЕНКА:\s*(\d+)/10', moderation_result)
+        reason_match = re.search(r'ПРИЧИНА:\s*(.+)', moderation_result)
+        recommendation_match = re.search(r'РЕКОМЕНДАЦИЯ:\s*(.+)', moderation_result)
+        
+        score = int(score_match.group(1)) if score_match else 0
+        reason = reason_match.group(1) if reason_match else "Не указана"
+        recommendation = recommendation_match.group(1) if recommendation_match else "Не указана"
+        
+        return {
+            "score": score,
+            "reason": reason,
+            "recommendation": recommendation,
+            "full_response": moderation_result
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка парсинга модерации: {e}")
+        return {
+            "score": 0,
+            "reason": "Ошибка анализа",
+            "recommendation": "Пропустить",
+            "full_response": f"Ошибка: {str(e)}"
+        }
+
+async def handle_moderation(message: types.Message):
+    """Обработка модерации сообщения"""
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    
+    # Получаем настройки группы
+    group_settings = get_group_settings(chat_id)
+    if not group_settings or not group_settings['moderation_enabled']:
+        return None
+    
+    # Пропускаем короткие сообщения чтобы не спамить
+    if len(message.text.strip()) < 3:
+        return None
+    
+    # Пропускаем команды
+    if message.text.startswith('/'):
+        return None
+    
+    logger.info(f"🔍 Анализ сообщения от {user_id} в чате {chat_id}")
+    
+    # Анализируем сообщение
+    moderation_result = moderate_message(message.text)
+    
+    logger.info(f"📊 Результат модерации: оценка {moderation_result['score']}/10")
+    
+    # Если оценка опасности высокая
+    if moderation_result['score'] >= 7:
+        # Добавляем предупреждение
+        add_warning_to_db(user_id, chat_id, moderation_result['reason'], (await bot.get_me()).id)
+        
+        warnings_count = get_warnings_count(user_id, chat_id)
+        
+        # Формируем сообщение предупреждения
+        user_mention = message.from_user.mention if message.from_user.mention else f"Пользователь {user_id}"
+        
+        warning_text = (
+            f"⚠️ **Предупреждение модератора**\n\n"
+            f"👤 Пользователь: {user_mention}\n"
+            f"📊 Уровень опасности: {moderation_result['score']}/10\n"
+            f"📝 Причина: {moderation_result['reason']}\n"
+            f"🔢 Предупреждений: {warnings_count}\n"
+            f"💡 Рекомендация: {moderation_result['recommendation']}"
+        )
+        
+        # Отправляем предупреждение
+        await message.reply(warning_text, parse_mode="Markdown")
+        
+        # Если много предупреждений - предлагаем бан
+        if warnings_count >= 3:
+            admin_text = "\n\n👮 Администраторам: рекомендуется принять меры."
+            await message.reply(
+                f"🚨 У пользователя {user_mention} уже {warnings_count} предупреждений!{admin_text}",
+                parse_mode="Markdown"
+            )
+        
+        return True
+    
+    return False
+
+# ==================== ИСПРАВЛЕННЫЙ ДЕКОРАТОР АДМИНА ====================
+def admin_required(func):
+    """Декоратор для проверки прав админа"""
+    @wraps(func)
+    async def wrapper(message: types.Message, *args, **kwargs):
+        user_id = message.from_user.id
+        
+        if not is_admin(user_id):
+            logger.warning(f"🚫 Попытка доступа к админ-панели от не-админа: {user_id}")
+            await message.answer("❌ У вас нет прав доступа к админ-панели")
+            return
+        
+        # Вызываем оригинальную функцию только с message
+        return await func(message)
+    return wrapper
+
+# ==================== ЗАЩИЩЕННЫЕ АДМИН КОМАНДЫ ====================
+@dp.message(Command("admin"))
+@admin_required
+async def admin_panel(message: types.Message):
+    """Админ панель (только для админов)"""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📊 Статистика бота", callback_data="admin_stats")
+    builder.button(text="👥 Список пользователей", callback_data="admin_users")
+    builder.button(text="🚫 Заблокированные", callback_data="admin_blocked")
+    builder.button(text="👥 Группы", callback_data="admin_groups")
+    builder.button(text="🔄 Обновить базу", callback_data="admin_refresh")
+    builder.adjust(2)
+    
+    await message.answer(
+        "🛠 **Админ-панель**\n\n"
+        "Выберите действие:",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown"
+    )
+
+@dp.message(Command("block"))
+@admin_required
+async def block_user_command(message: types.Message):
+    """Блокировка пользователя (только для админов)"""
+    try:
+        target_user_id = int(message.text.split()[1])
+        block_user_in_db(target_user_id)
+        
+        await message.answer(f"✅ Пользователь {target_user_id} заблокирован")
+        logger.info(f"🔒 Админ {message.from_user.id} заблокировал пользователя {target_user_id}")
+        
+    except (IndexError, ValueError):
+        await message.answer("❌ Использование: /block <user_id>")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}")
+
+@dp.message(Command("unblock"))
+@admin_required
+async def unblock_user_command(message: types.Message):
+    """Разблокировка пользователя (только для админов)"""
+    try:
+        target_user_id = int(message.text.split()[1])
+        unblock_user_in_db(target_user_id)
+        
+        await message.answer(f"✅ Пользователь {target_user_id} разблокирован")
+        logger.info(f"🔓 Админ {message.from_user.id} разблокировал пользователя {target_user_id}")
+        
+    except (IndexError, ValueError):
+        await message.answer("❌ Использование: /unblock <user_id>")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}")
+
+@dp.message(Command("userinfo"))
+@admin_required
+async def user_info_command(message: types.Message):
+    """Информация о пользователе (только для админов)"""
+    try:
+        target_user_id = int(message.text.split()[1])
+        user, messages_count = get_user_stats(target_user_id)
+        
+        if user:
+            status = "🚫 Заблокирован" if user['is_blocked'] else "✅ Активен"
+            info_text = (
+                f"👤 **Информация о пользователе**\n\n"
+                f"🆔 ID: `{user['user_id']}`\n"
+                f"📛 Имя: {user['first_name'] or 'Не указано'}\n"
+                f"👤 Username: @{user['username'] or 'Не указан'}\n"
+                f"📅 Регистрация: {user['created_at']}\n"
+                f"📊 Сообщений: {messages_count}\n"
+                f"🔒 Статус: {status}"
+            )
+            
+            builder = InlineKeyboardBuilder()
+            if user['is_blocked']:
+                builder.button(text="🔓 Разблокировать", callback_data=f"unblock_{user['user_id']}")
+            else:
+                builder.button(text="🚫 Заблокировать", callback_data=f"block_{user['user_id']}")
+            builder.button(text="📝 История сообщений", callback_data=f"history_{user['user_id']}")
+            builder.adjust(2)
+            
+            await message.answer(info_text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+        else:
+            await message.answer("❌ Пользователь не найден")
+            
+    except (IndexError, ValueError):
+        await message.answer("❌ Использование: /userinfo <user_id>")
+
+# ==================== КОМАНДЫ ДЛЯ ГРУПП ====================
+@dp.message(Command("moderation"))
+async def moderation_command(message: types.Message):
+    """Управление модерацией в группе"""
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    
+    # Проверяем, что команда вызвана в группе и от админа группы
+    if message.chat.type not in ["group", "supergroup"]:
+        await message.answer("❌ Эта команда работает только в группах")
+        return
+    
+    if not await is_chat_admin(chat_id, user_id):
+        await message.answer("❌ Только администраторы группы могут управлять модерацией")
+        return
+    
+    try:
+        action = message.text.split()[1].lower()
+        
+        if action in ["on", "вкл", "enable"]:
+            set_group_moderation(chat_id, True)
+            await message.answer("✅ Модерация включена")
+        elif action in ["off", "выкл", "disable"]:
+            set_group_moderation(chat_id, False)
+            await message.answer("❌ Модерация выключена")
+        else:
+            await message.answer("❌ Использование: /moderation on/off")
+            
+    except IndexError:
+        # Показываем текущий статус
+        group_settings = get_group_settings(chat_id)
+        status = "✅ Включена" if group_settings and group_settings['moderation_enabled'] else "❌ Выключена"
+        await message.answer(f"🔧 Текущий статус модерации: {status}")
+
+async def is_chat_admin(chat_id: int, user_id: int) -> bool:
+    """Проверка, является ли пользователь админом чата"""
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ["administrator", "creator"]
+    except Exception as e:
+        logger.error(f"Ошибка проверки прав админа: {e}")
         return False
 
-def is_super_admin(user_id):
-    """Проверить, является ли супер-админом"""
-    return user_id in SUPER_ADMINS
-
-def contains_bad_words(text):
-    text_lower = text.lower()
-    for word in BAD_WORDS:
-        if word in text_lower:
-            return True, word
-    return False, ""
-
-def is_spam(text):
-    text_lower = text.lower()
-    return any(word in text_lower for word in SPAM_KEYWORDS)
-
-def send_auto_report(action_type, chat_id, user_id, target_user_id=None, reason=None):
-    """Отправка автоотчета в ЛС админам"""
-    try:
-        chat_info = bot.get_chat(chat_id)
-        user_info = bot.get_chat(user_id)
+# ==================== ОБРАБОТЧИКИ СОБЫТИЙ ГРУПП ====================
+@dp.chat_member(ChatMemberUpdatedFilter(IS_NOT_MEMBER >> IS_MEMBER))
+async def on_bot_added_to_chat(chat_member: ChatMemberUpdated):
+    """Обработчик добавления бота в чат"""
+    if chat_member.new_chat_member.user.id == (await bot.get_me()).id:
+        chat_id = chat_member.chat.id
+        chat_title = chat_member.chat.title
         
-        if target_user_id:
-            target_info = bot.get_chat(target_user_id)
-            target_name = target_info.first_name if target_info.first_name else "Неизвестно"
-        else:
-            target_name = "Не указан"
+        # Добавляем группу в базу
+        add_group_to_db(chat_id, chat_title)
         
-        report_text = f"""
-📊 АВТООТЧЕТ О ДЕЙСТВИИ
-
-🕐 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-🎯 Действие: {action_type}
-💬 Чат: {chat_info.title if hasattr(chat_info, 'title') else 'ЛС'}
-👤 Модератор: {user_info.first_name} (ID: {user_id})
-🎯 Цель: {target_name} (ID: {target_user_id if target_user_id else 'N/A'})
-📝 Причина: {reason if reason else 'Не указана'}
-        """
-        
-        # Отправляем отчет всем админам и супер-админам
-        all_admins = set(SUPER_ADMINS)
-        for admin in db.get_all_admins():
-            all_admins.add(admin[0])
-        
-        for admin_id in all_admins:
-            try:
-                bot.send_message(admin_id, report_text)
-            except Exception as e:
-                print(f"❌ Не удалось отправить отчет админу {admin_id}: {e}")
-        
-        # Сохраняем в базу данных
-        db.add_report(
-            action_type=action_type,
-            chat_id=chat_id,
-            chat_title=chat_info.title if hasattr(chat_info, 'title') else 'ЛС',
-            user_id=user_id,
-            username=user_info.first_name,
-            target_user_id=target_user_id,
-            target_username=target_name,
-            reason=reason
+        welcome_text = (
+            "🤖 **Привет! Я ИИ-модератор и помощник!**\n\n"
+            "🔧 **Мои функции:**\n"
+            "• Автоматическая модерация сообщений\n"
+            "• Анализ контента на опасность\n"
+            "• Предупреждения о нарушениях\n"
+            "• Умные ответы в разных стилях\n\n"
+            "⚙️ **Команды для админов:**\n"
+            "`/moderation on/off` - включить/выключить модерацию\n"
+            "`/mode` - выбрать стиль общения\n\n"
+            "📝 **Модерация автоматически включена.** "
+            "Я буду анализировать сообщения и предупреждать о нарушениях!"
         )
         
-    except Exception as e:
-        print(f"❌ Ошибка отправки автоотчета: {e}")
+        await bot.send_message(chat_id, welcome_text, parse_mode="Markdown")
+        logger.info(f"🤖 Бот добавлен в группу: {chat_title} ({chat_id})")
 
-# 🔐 КОМАНДЫ УПРАВЛЕНИЯ АДМИНАМИ
-@bot.message_handler(commands=['addadmin'])
-def add_admin_command(message):
-    """Добавить админа"""
-    try:
-        chat_id = message.chat.id
-        user_id = message.from_user.id
-        
-        # Только супер-админы могут добавлять админов
-        if not is_super_admin(user_id):
-            bot.reply_to(message, "❌ Только супер-админы могут добавлять админов!")
-            return
-        
-        if not message.reply_to_message:
-            bot.reply_to(message, "❌ Ответь на сообщение пользователя, которого хочешь сделать админом!")
-            return
-        
-        target_user = message.reply_to_message.from_user
-        
-        # Нельзя добавить самого себя (и так админ)
-        if target_user.id == user_id:
-            bot.reply_to(message, "❌ Ты и так админ!")
-            return
-        
-        # Проверяем, не супер-админ ли уже
-        if target_user.id in SUPER_ADMINS:
-            bot.reply_to(message, "❌ Этот пользователь уже супер-админ!")
-            return
-        
-        # Проверяем, не админ ли уже
-        if db.is_admin(target_user.id):
-            bot.reply_to(message, "❌ Этот пользователь уже админ!")
-            return
-        
-        # Добавляем админа
-        db.add_admin(
-            user_id=target_user.id,
-            username=target_user.first_name or target_user.username or "Unknown",
-            added_by=user_id,
-            level=1
-        )
-        
-        # Отправляем автоотчет
-        send_auto_report("ADD_ADMIN", chat_id, user_id, target_user.id, "Добавление админа")
-        
-        bot.reply_to(message, f"✅ {target_user.first_name} теперь админ!")
-        
-        # Уведомляем нового админа
-        try:
-            bot.send_message(
-                target_user.id,
-                f"🎉 Поздравляем! Теперь вы админ бота-модератора!\n\n"
-                f"Доступные команды:\n"
-                f"/ban - бан пользователя\n"
-                f"/kick - кик пользователя\n"
-                f"/mute - мут пользователя\n"
-                f"/warn - выдать предупреждение\n"
-                f"И другие команды модерации!"
-            )
-        except:
-            pass
-            
-    except Exception as e:
-        print(f"❌ Ошибка в /addadmin: {e}")
-        bot.reply_to(message, "❌ Ошибка при добавлении админа!")
+# ==================== ОБРАБОТЧИКИ СООБЩЕНИЙ ====================
+@dp.message()
+async def handle_all_messages(message: types.Message):
+    """Обработчик всех сообщений"""
+    # Игнорируем служебные сообщения
+    if not message.text:
+        return
+    
+    # Если сообщение в группе - обрабатываем модерацию
+    if message.chat.type in ["group", "supergroup"]:
+        await handle_group_message(message)
+    else:
+        # Личные сообщения - обычная обработка
+        await handle_private_message(message)
 
-@bot.message_handler(commands=['removeadmin'])
-def remove_admin_command(message):
-    """Удалить админа"""
-    try:
-        chat_id = message.chat.id
-        user_id = message.from_user.id
-        
-        # Только супер-админы могут удалять админов
-        if not is_super_admin(user_id):
-            bot.reply_to(message, "❌ Только супер-админы могут удалять админов!")
-            return
-        
-        if not message.reply_to_message:
-            bot.reply_to(message, "❌ Ответь на сообщение админа, которого хочешь удалить!")
-            return
-        
-        target_user = message.reply_to_message.from_user
-        
-        # Нельзя удалить самого себя
-        if target_user.id == user_id:
-            bot.reply_to(message, "❌ Нельзя удалить самого себя!")
-            return
-        
-        # Нельзя удалить супер-админа
-        if target_user.id in SUPER_ADMINS:
-            bot.reply_to(message, "❌ Нельзя удалить супер-админа!")
-            return
-        
-        # Проверяем, является ли админом
-        if not db.is_admin(target_user.id):
-            bot.reply_to(message, "❌ Этот пользователь не является админом!")
-            return
-        
-        # Удаляем админа
-        db.remove_admin(target_user.id)
-        
-        # Отправляем автоотчет
-        send_auto_report("REMOVE_ADMIN", chat_id, user_id, target_user.id, "Удаление админа")
-        
-        bot.reply_to(message, f"✅ {target_user.first_name} больше не админ!")
-        
-    except Exception as e:
-        print(f"❌ Ошибка в /removeadmin: {e}")
-        bot.reply_to(message, "❌ Ошибка при удалении админа!")
+async def handle_group_message(message: types.Message):
+    """Обработка сообщений в группах"""
+    # Проверяем модерацию
+    moderation_action = await handle_moderation(message)
+    
+    # Если сообщение не было заблокировано модерацией, обрабатываем как обычное
+    if not moderation_action:
+        # Можно добавить ответы бота в группах по определенным триггерам
+        if message.text.startswith('!бот') or message.text.startswith('/ask'):
+            await handle_private_message(message)
 
-@bot.message_handler(commands=['adminlist'])
-def admin_list_command(message):
-    """Список всех админов"""
-    try:
-        chat_id = message.chat.id
-        user_id = message.from_user.id
-        
-        if not is_user_admin(chat_id, user_id):
-            bot.reply_to(message, "❌ Только админы могут просматривать список админов!")
-            return
-        
-        admins_list = ["👑 СУПЕР-АДМИНЫ:"]
-        
-        # Добавляем супер-админов
-        for super_admin_id in SUPER_ADMINS:
-            try:
-                user_info = bot.get_chat(super_admin_id)
-                admins_list.append(f"👑 {user_info.first_name} (ID: {super_admin_id})")
-            except:
-                admins_list.append(f"👑 Unknown (ID: {super_admin_id})")
-        
-        admins_list.append("\n👨‍💼 АДМИНЫ БОТА:")
-        
-        # Добавляем админов из БД
-        db_admins = db.get_all_admins()
-        if db_admins:
-            for admin in db_admins:
-                admin_id, username, added_by, added_date, level = admin
-                try:
-                    user_info = bot.get_chat(admin_id)
-                    display_name = user_info.first_name
-                except:
-                    display_name = username or "Unknown"
-                
-                admins_list.append(f"🛡️ {display_name} (ID: {admin_id})")
-        else:
-            admins_list.append("Нет добавленных админов")
-        
-        response = "\n".join(admins_list)
-        bot.reply_to(message, response)
-        
-    except Exception as e:
-        print(f"❌ Ошибка в /adminlist: {e}")
-        bot.reply_to(message, "❌ Ошибка при получении списка админов!")
-
-@bot.message_handler(commands=['myadmin'])
-def my_admin_info(message):
-    """Информация о своих правах админа"""
-    try:
-        user_id = message.from_user.id
-        chat_id = message.chat.id
-        
-        if is_super_admin(user_id):
-            status = "👑 СУПЕР-АДМИН"
-        elif db.is_admin(user_id):
-            admin_info = db.get_admin(user_id)
-            status = f"🛡️ АДМИН (Уровень: {admin_info[4]})"
-        elif is_user_admin(chat_id, user_id):
-            status = "💬 АДМИН ЧАТА"
-        else:
-            status = "👤 ПОЛЬЗОВАТЕЛЬ"
-        
-        response = f"""
-📋 ИНФОРМАЦИЯ О ПРАВАХ:
-
-👤 Ваш ID: {user_id}
-🎯 Статус: {status}
-💬 Чат: {message.chat.title if hasattr(message.chat, 'title') else 'ЛС'}
-
-{"⚠️ Внимание: Вы не являетесь админом бота!" if status == "👤 ПОЛЬЗОВАТЕЛЬ" else "✅ Вы имеете права модерации!"}
-        """
-        
-        bot.reply_to(message, response)
-        
-    except Exception as e:
-        print(f"❌ Ошибка в /myadmin: {e}")
-
-# 🛡️ ОСНОВНЫЕ КОМАНДЫ МОДЕРАЦИИ (с проверкой иммунитета админов)
-def check_admin_immunity(chat_id, target_user_id, action_name):
-    """Проверить иммунитет админа перед действием"""
-    if is_user_admin(chat_id, target_user_id):
-        return f"❌ Нельзя {action_name} других админов!"
-    return None
-
-@bot.message_handler(commands=['ban'])
-def ban_user(message):
-    """Забанить пользователя"""
-    try:
-        chat_id = message.chat.id
-        user_id = message.from_user.id
-        
-        if not is_user_admin(chat_id, user_id):
-            bot.reply_to(message, "❌ Только админы могут банить!")
-            return
-        
-        if not message.reply_to_message:
-            bot.reply_to(message, "❌ Ответь на сообщение пользователя!")
-            return
-        
-        target_user = message.reply_to_message.from_user
-        
-        # Проверяем иммунитет админа
-        immunity_check = check_admin_immunity(chat_id, target_user.id, "банить")
-        if immunity_check:
-            bot.reply_to(message, immunity_check)
-            return
-        
-        reason = ' '.join(message.text.split()[1:]) or 'Нарушение правил'
-        
-        bot.ban_chat_member(chat_id, target_user.id)
-        db.update_stats(chat_id, 'bans')
-        
-        # Отправляем автоотчет
-        send_auto_report("BAN", chat_id, user_id, target_user.id, reason)
-        
-        bot.reply_to(message, f"🚫 {target_user.first_name} забанен!\n📝 Причина: {reason}")
-        
-    except Exception as e:
-        print(f"❌ Ошибка в /ban: {e}")
-
-@bot.message_handler(commands=['kick'])
-def kick_user(message):
-    """Кикнуть пользователя"""
-    try:
-        chat_id = message.chat.id
-        user_id = message.from_user.id
-        
-        if not is_user_admin(chat_id, user_id):
-            bot.reply_to(message, "❌ Только админы могут кикать!")
-            return
-        
-        if not message.reply_to_message:
-            bot.reply_to(message, "❌ Ответь на сообщение пользователя!")
-            return
-        
-        target_user = message.reply_to_message.from_user
-        
-        # Проверяем иммунитет админа
-        immunity_check = check_admin_immunity(chat_id, target_user.id, "кикать")
-        if immunity_check:
-            bot.reply_to(message, immunity_check)
-            return
-        
-        reason = ' '.join(message.text.split()[1:]) or 'Нарушение правил'
-        
-        bot.ban_chat_member(chat_id, target_user.id)
-        bot.unban_chat_member(chat_id, target_user.id)
-        db.update_stats(chat_id, 'kicks')
-        
-        # Отправляем автоотчет
-        send_auto_report("KICK", chat_id, user_id, target_user.id, reason)
-        
-        bot.reply_to(message, f"👢 {target_user.first_name} кикнут!\n📝 Причина: {reason}")
-        
-    except Exception as e:
-        print(f"❌ Ошибка в /kick: {e}")
-
-@bot.message_handler(commands=['mute'])
-def mute_user(message):
-    """Замутить пользователя"""
-    try:
-        chat_id = message.chat.id
-        user_id = message.from_user.id
-        
-        if not is_user_admin(chat_id, user_id):
-            bot.reply_to(message, "❌ Только админы могут мутить!")
-            return
-        
-        if not message.reply_to_message:
-            bot.reply_to(message, "❌ Ответь на сообщение пользователя!")
-            return
-        
-        target_user = message.reply_to_message.from_user
-        
-        # Проверяем иммунитет админа
-        immunity_check = check_admin_immunity(chat_id, target_user.id, "мутить")
-        if immunity_check:
-            bot.reply_to(message, immunity_check)
-            return
-        
-        args = message.text.split()[1:]
-        duration = int(args[0]) if args and args[0].isdigit() else 60
-        
-        until_date = int(time.time()) + duration * 60
-        bot.restrict_chat_member(
-            chat_id, target_user.id,
-            until_date=until_date,
-            permissions=telebot.types.ChatPermissions(
-                can_send_messages=False,
-                can_send_media_messages=False,
-                can_send_other_messages=False,
-                can_add_web_page_previews=False
-            )
-        )
-        
-        db.update_stats(chat_id, 'mutes')
-        
-        # Отправляем автоотчет
-        reason = f'Мут на {duration} минут'
-        send_auto_report("MUTE", chat_id, user_id, target_user.id, reason)
-        
-        bot.reply_to(message, f"🔇 {target_user.first_name} замьючен на {duration} минут!")
-        
-    except Exception as e:
-        print(f"❌ Ошибка в /mute: {e}")
-
-@bot.message_handler(commands=['warn'])
-def warn_user(message):
-    """Выдать предупреждение"""
-    try:
-        chat_id = message.chat.id
-        user_id = message.from_user.id
-        
-        if not is_user_admin(chat_id, user_id):
-            bot.reply_to(message, "❌ Только админы могут выдавать варны!")
-            return
-        
-        if not message.reply_to_message:
-            bot.reply_to(message, "❌ Ответь на сообщение пользователя!")
-            return
-        
-        target_user = message.reply_to_message.from_user
-        
-        # Проверяем иммунитет админа
-        immunity_check = check_admin_immunity(chat_id, target_user.id, "выдавать варны")
-        if immunity_check:
-            bot.reply_to(message, immunity_check)
-            return
-        
-        reason = ' '.join(message.text.split()[1:]) or 'Нарушение правил'
-        
-        db.add_warn(chat_id, target_user.id, target_user.first_name, reason, user_id)
-        warns_count = db.get_warns_count(chat_id, target_user.id)
-        db.update_stats(chat_id, 'warns')
-        
-        # Отправляем автоотчет
-        send_auto_report("WARN", chat_id, user_id, target_user.id, reason)
-        
-        response = f"⚠️ {target_user.first_name} получил предупреждение!\n📝 Причина: {reason}\n🎯 Всего варнов: {warns_count}/3"
-        
-        if warns_count >= 3:
-            until_date = int(time.time()) + 60 * 60
-            bot.restrict_chat_member(
-                chat_id, target_user.id,
-                until_date=until_date,
-                permissions=telebot.types.ChatPermissions(
-                    can_send_messages=False,
-                    can_send_media_messages=False,
-                    can_send_other_messages=False
-                )
-            )
-            db.clear_warns(chat_id, target_user.id)
-            response += f"\n🔇 Автоматический мут на 1 час!"
-        
-        bot.reply_to(message, response)
-        
-    except Exception as e:
-        print(f"❌ Ошибка в /warn: {e}")
-
-# 🔧 ОСТАЛЬНЫЕ КОМАНДЫ (остаются без изменений)
-@bot.message_handler(commands=['unmute'])
-def unmute_user(message):
-    """Размутить пользователя"""
-    try:
-        chat_id = message.chat.id
-        user_id = message.from_user.id
-        
-        if not is_user_admin(chat_id, user_id):
-            bot.reply_to(message, "❌ Только админы могут размучивать!")
-            return
-        
-        if not message.reply_to_message:
-            bot.reply_to(message, "❌ Ответь на сообщение пользователя!")
-            return
-        
-        target_user = message.reply_to_message.from_user
-        
-        bot.restrict_chat_member(
-            chat_id, target_user.id,
-            permissions=telebot.types.ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True
-            )
-        )
-        
-        # Отправляем автоотчет
-        send_auto_report("UNMUTE", chat_id, user_id, target_user.id, "Размут")
-        
-        bot.reply_to(message, f"🔊 {target_user.first_name} размучен!")
-        
-    except Exception as e:
-        print(f"❌ Ошибка в /unmute: {e}")
-
-@bot.message_handler(commands=['unwarn'])
-def unwarn_user(message):
-    """Снять предупреждение"""
-    try:
-        chat_id = message.chat.id
-        user_id = message.from_user.id
-        
-        if not is_user_admin(chat_id, user_id):
-            bot.reply_to(message, "❌ Только админы могут снимать варны!")
-            return
-        
-        if not message.reply_to_message:
-            bot.reply_to(message, "❌ Ответь на сообщение пользователя!")
-            return
-        
-        target_user = message.reply_to_message.from_user
-        
-        db.clear_warns(chat_id, target_user.id)
-        
-        # Отправляем автоотчет
-        send_auto_report("UNWARN", chat_id, user_id, target_user.id, "Снятие всех варнов")
-        
-        bot.reply_to(message, f"✅ Все предупреждения сняты с {target_user.first_name}!")
-        
-    except Exception as e:
-        print(f"❌ Ошибка в /unwarn: {e}")
-
-@bot.message_handler(commands=['report'])
-def send_daily_report(message):
-    """Отправить дневной отчет"""
-    try:
-        chat_id = message.chat.id
-        user_id = message.from_user.id
-        
-        if not is_user_admin(chat_id, user_id):
-            bot.reply_to(message, "❌ Только админы могут запрашивать отчеты!")
-            return
-        
-        today_stats = db.get_today_stats()
-        
-        report_text = f"""
-📊 ДНЕВНОЙ ОТЧЕТ ЗА {datetime.now().strftime('%d.%m.%Y')}
-
-📈 СТАТИСТИКА ДЕЙСТВИЙ:
-• Баны: {today_stats.get('BAN', 0)}
-• Кики: {today_stats.get('KICK', 0)}
-• Муты: {today_stats.get('MUTE', 0)}
-• Варны: {today_stats.get('WARN', 0)}
-• Размуты: {today_stats.get('UNMUTE', 0)}
-• Очистки: {today_stats.get('CLEAR', 0) + today_stats.get('PURGE', 0)}
-
-🕐 Сгенерировано: {datetime.now().strftime('%H:%M:%S')}
-        """
-        
-        bot.reply_to(message, report_text)
-        
-    except Exception as e:
-        print(f"❌ Ошибка в /report: {e}")
-
-# 🎯 КОМАНДА HELP (обновленная)
-@bot.message_handler(commands=['start', 'help', 'menu'])
-def start_command(message):
+async def handle_private_message(message: types.Message):
+    """Обработка личных сообщений"""
     user_id = message.from_user.id
-    is_admin_user = is_user_admin(message.chat.id, user_id)
+    username = message.from_user.username or "без username"
     
-    response = """
-🤖 УЛУЧШЕННЫЙ БОТ-МОДЕРАТОР
-
-🛡️ ОСНОВНЫЕ КОМАНДЫ:
-/ban - забанить пользователя
-/kick - кикнуть пользователя  
-/mute - замутить
-/unmute - размутить
-/warn - выдать предупреждение
-/unwarn - снять все варны
-/warns - проверить варны
-
-🧹 УПРАВЛЕНИЕ СООБЩЕНИЯМИ:
-/clear - удалить сообщение
-/purge [число] - массовое удаление
-/pin - закрепить сообщение
-/unpin - открепить сообщение
-
-📊 ОТЧЕТНОСТЬ:
-/report - дневной отчет
-/myadmin - информация о правах
-"""
+    if is_user_blocked(user_id):
+        await message.answer("❌ Вы заблокированы в этом боте")
+        return
     
-    # Добавляем команды для супер-админов
-    if is_super_admin(user_id):
-        response += """
-🔐 СУПЕР-АДМИН КОМАНДЫ:
-/addadmin - добавить админа
-/removeadmin - удалить админа  
-/adminlist - список всех админов
-"""
-    elif is_admin_user:
-        response += "\n/adminlist - список админов"
+    # Добавляем пользователя в базу
+    add_user_to_db(user_id, username, message.from_user.first_name or "", message.from_user.last_name or "")
     
-    response += """
-🔧 ДОПОЛНИТЕЛЬНО:
-/id - получить ID пользователя
+    current_mode = user_modes.get(user_id, "normal")
+    
+    logger.info(f"📨 Входящее сообщение от {user_id} ({username}): {message.text[:50]}...")
+    
+    await bot.send_chat_action(message.chat.id, "typing")
+    
+    start_time = datetime.now()
+    reply = ask_openrouter(message.text, MODES[current_mode], user_id)
+    processing_time = (datetime.now() - start_time).total_seconds()
+    
+    logger.info(f"📤 Ответ пользователю {user_id} отправлен за {processing_time:.2f} сек")
+    
+    # Сохраняем сообщение в историю
+    add_message_to_db(user_id, message.text, reply, current_mode)
+    
+    if len(reply) > 4000:
+        for i in range(0, len(reply), 4000):
+            await message.answer(reply[i:i+4000])
+    else:
+        await message.answer(reply)
 
-🚫 АВТО-МОДЕРАЦИЯ:
-• Блокирует маты (60+ слов)
-• Удаляет спам и рекламу
-• Защищает от каналов
-• Система предупреждений
-• Автоотчеты в ЛС админам
-• Иммунитет админов
-"""
-    bot.reply_to(message, response)
+# ==================== ОСНОВНЫЕ КОМАНДЫ ====================
+@dp.message(Command("start"))
+async def start_command(message: types.Message):
+    """Обработчик команды /start"""
+    user_id = message.from_user.id
+    
+    if is_user_blocked(user_id):
+        await message.answer("❌ Вы заблокированы в этом боте")
+        return
+    
+    # Добавляем пользователя в базу
+    add_user_to_db(user_id, message.from_user.username or "", 
+                  message.from_user.first_name or "", message.from_user.last_name or "")
+    
+    logger.info(f"👤 Пользователь {user_id} запустил бота")
+    
+    builder = InlineKeyboardBuilder()
+    for mode_key in MODES.keys():
+        builder.button(text=mode_key.capitalize(), callback_data=f"mode_{mode_key}")
+    builder.adjust(2)
+    
+    admin_text = "\n\n🛠 Вы администратор! Доступна команда /admin" if is_admin(user_id) else ""
+    
+    await message.answer(
+        f"🤖 Привет! Я бот на базе OpenRouter\n\nВыбери стиль общения:{admin_text}",
+        reply_markup=builder.as_markup()
+    )
 
-print("🚀 Улучшенный бот-модератор запущен!")
-print("📊 База данных: moderation.db")
-print("📨 Система автоотчетов активирована!")
-print("🔐 Система управления админами активирована!")
-bot.polling()
+@dp.message(Command("mode"))
+async def mode_command(message: types.Message):
+    """Команда для смены режима"""
+    user_id = message.from_user.id
+    
+    if is_user_blocked(user_id):
+        await message.answer("❌ Вы заблокированы в этом боте")
+        return
+    
+    logger.info(f"🔄 Пользователь {user_id} запросил смену режима")
+    await start_command(message)
+
+@dp.message(Command("current_mode"))
+async def current_mode_command(message: types.Message):
+    """Показывает текущий режим пользователя"""
+    user_id = message.from_user.id
+    
+    if is_user_blocked(user_id):
+        await message.answer("❌ Вы заблокированы в этом боте")
+        return
+    
+    current_mode = user_modes.get(user_id, "normal")
+    
+    logger.info(f"📋 Пользователь {user_id} запросил текущий режим: {current_mode}")
+    
+    mode_descriptions = {
+        "normal": "👤 Обычный режим",
+        "programmer": "💻 Режим программиста", 
+        "fun": "😄 Развлекательный режим",
+        "angry": "😠 Злой режим",
+        "nsfw": "🔞 Матерный режим",
+        "helper": "🤝 Режим помощника",
+        "chat": "💬 Режим общения"
+    }
+    
+    await message.answer(
+        f"📋 Твой текущий режим: {mode_descriptions.get(current_mode, '👤 Обычный')}\n"
+        f"Используй /mode чтобы изменить режим"
+    )
+
+# ==================== CALLBACK ОБРАБОТЧИКИ ====================
+@dp.callback_query()
+async def callback_handler(callback: types.CallbackQuery):
+    """Обработчик callback-запросов"""
+    user_id = callback.from_user.id
+    data = callback.data
+    
+    # Обработка режимов (доступно всем)
+    if data.startswith("mode_"):
+        mode = data[5:]
+        if mode in MODES:
+            user_modes[user_id] = mode
+            await callback.message.edit_text(f"✅ Режим изменён на: {mode}")
+        await callback.answer()
+        return
+    
+    # Админские callback (только для админов)
+    if not is_admin(user_id):
+        await callback.answer("❌ Нет прав доступа")
+        return
+    
+    # Обработка админских callback
+    if data == "admin_stats":
+        users = get_all_users()
+        total_users = len(users)
+        active_users = len([u for u in users if not u['is_blocked']])
+        blocked_users = len([u for u in users if u['is_blocked']])
+        total_messages = sum(user['messages_count'] for user in users)
+        
+        stats_text = (
+            "📊 **Статистика бота**\n\n"
+            f"👥 Всего пользователей: {total_users}\n"
+            f"✅ Активных: {active_users}\n"
+            f"🚫 Заблокированных: {blocked_users}\n"
+            f"💬 Всего сообщений: {total_messages}\n"
+            f"🕒 Время работы: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        await callback.message.edit_text(stats_text, parse_mode="Markdown")
+    
+    elif data == "admin_users":
+        users = get_all_users()[:20]
+        users_text = "👥 **Последние 20 пользователей:**\n\n"
+        
+        for user in users:
+            status = "🚫" if user['is_blocked'] else "✅"
+            users_text += f"{status} ID: `{user['user_id']}` - {user['first_name'] or 'No name'}"
+            if user['username']:
+                users_text += f" (@{user['username']})"
+            users_text += f" - {user['messages_count']} сообщ.\n"
+        
+        await callback.message.edit_text(users_text, parse_mode="Markdown")
+    
+    elif data == "admin_blocked":
+        users = get_all_users()
+        blocked = [u for u in users if u['is_blocked']]
+        
+        if blocked:
+            blocked_text = "🚫 **Заблокированные пользователи:**\n\n"
+            for user in blocked[:15]:
+                blocked_text += f"ID: `{user['user_id']}` - {user['first_name'] or 'No name'}"
+                if user['username']:
+                    blocked_text += f" (@{user['username']})\n"
+                else:
+                    blocked_text += "\n"
+        else:
+            blocked_text = "✅ Нет заблокированных пользователей"
+        
+        await callback.message.edit_text(blocked_text, parse_mode="Markdown")
+    
+    elif data.startswith("block_"):
+        target_user_id = int(data[6:])
+        block_user_in_db(target_user_id)
+        await callback.message.edit_text(f"✅ Пользователь {target_user_id} заблокирован")
+        logger.info(f"🔒 Админ {user_id} заблокировал пользователя {target_user_id}")
+    
+    elif data.startswith("unblock_"):
+        target_user_id = int(data[8:])
+        unblock_user_in_db(target_user_id)
+        await callback.message.edit_text(f"✅ Пользователь {target_user_id} разблокирован")
+        logger.info(f"🔓 Админ {user_id} разблокировал пользователя {target_user_id}")
+    
+    elif data.startswith("history_"):
+        target_user_id = int(data[8:])
+        messages = get_user_messages(target_user_id, 5)
+        
+        if messages:
+            history_text = f"📝 **Последние 5 сообщений пользователя {target_user_id}:**\n\n"
+            for msg in reversed(messages):
+                history_text += f"🕒 {msg['timestamp']}\n"
+                history_text += f"📤: {msg['message_text'][:100]}...\n"
+                history_text += f"📥: {msg['response_text'][:100]}...\n"
+                history_text += f"🔧 Режим: {msg['mode_used']}\n\n"
+        else:
+            history_text = f"📝 У пользователя {target_user_id} нет сообщений"
+        
+        await callback.message.edit_text(history_text, parse_mode="Markdown")
+    
+    elif data == "admin_refresh":
+        init_database()
+        await callback.message.edit_text("✅ База данных обновлена")
+    
+    await callback.answer()
+
+# ==================== ЗАПУСК БОТА ====================
+async def main():
+    """Основная функция запуска бота"""
+    # Инициализируем базу данных
+    init_database()
+    
+    logger.info("🚀 Запуск бота...")
+    logger.info(f"⏰ Время запуска: {datetime.now()}")
+    
+    try:
+        bot_info = await bot.get_me()
+        logger.info(f"🤖 Бот @{bot_info.username} запущен успешно")
+        logger.info(f"🆔 ID бота: {bot_info.id}")
+        logger.info(f"📛 Имя бота: {bot_info.first_name}")
+        
+        await dp.start_polling(bot)
+        
+    except Exception as e:
+        logger.critical(f"💥 Критическая ошибка при запуске бота: {e}", exc_info=True)
+    finally:
+        logger.info("🛑 Бот остановлен")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("⏹ Остановка бота по команде пользователя")
+    except Exception as e:
+        logger.critical(f"💥 Фатальная ошибка: {e}", exc_info=True)
